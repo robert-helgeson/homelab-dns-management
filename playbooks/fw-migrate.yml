@@ -1,0 +1,179 @@
+---
+# One-shot post-migration cleanup of the source zone (public) and any
+# stale source bindings on other zones. Three cleanup phases in order:
+#
+#   1. Strip rich rules from public whose source CIDR is now bound to
+#      a dedicated zone in hosts.yml (they became inert after the
+#      sources were re-bound by reconcile-fw.yml).
+#   2. Remove specific direct ports from public that have been moved
+#      into trusted-lan (LAN-only scoping instead of world-open).
+#   3. Unbind stale source CIDRs from other zones (e.g. dead k3s
+#      pod/service subnets left in the trusted zone).
+#
+# Each phase is list-driven - edit the vars below to tailor.
+# Run with --check --diff first, always.
+- name: Post-migration cleanup of firewalld
+  hosts: dns_primary
+  gather_facts: false
+  become: true
+
+  vars_files:
+    - ../hosts.yml
+
+  vars:
+    fw_target: primary-dns
+    source_zone: public
+
+    # Phase 2: direct ports on source_zone that are now covered by
+    # trusted-lan (moved with source restriction) or known-dead ghosts.
+    public_direct_ports_to_remove:
+      tcp:
+        - 8000     # ghost
+        - 8001     # ghost
+        - 10300    # ghost (wyoming-piper - not listening)
+        - 1883     # ghost (MQTT broker gone)
+        - 514      # ghost
+        - 3100     # kasm -> trusted-lan
+        - 9090     # cockpit -> trusted-lan
+        - 10200    # wyoming-whisper -> trusted-lan
+        - 11434    # ollama -> trusted-lan
+      udp:
+        - 5514     # wazuh syslog -> trusted-lan
+
+    # Phase 3: source CIDRs to unbind from zones other than source_zone.
+    # Keyed by zone name.
+    stale_source_bindings:
+      trusted:
+        - 10.42.0.0/16   # k3s pod CIDR (cluster gone)
+        - 10.43.0.0/16   # k3s service CIDR (cluster gone)
+
+  tasks:
+    # -------- Phase 1: rich rules in public matching migrated sources --------
+
+    - name: Collect all migrated source CIDRs from hosts.yml
+      set_fact:
+        migrated_sources: >-
+          {{ firewall[fw_target].zones.values()
+             | map(attribute='sources', default=[])
+             | sum(start=[]) | unique | list }}
+
+    - name: Fail fast if no sources to migrate
+      fail:
+        msg: "No sources listed under firewall.{{ fw_target }}.zones - nothing to migrate."
+      when: migrated_sources | length == 0
+
+    - name: Read current rich rules in source zone
+      command: "firewall-cmd --zone={{ source_zone }} --list-rich-rules"
+      register: rich_rules_raw
+      changed_when: false
+      check_mode: false
+
+    - name: Identify rich rules whose source matches a migrated CIDR
+      set_fact:
+        rules_to_remove: >-
+          {%- set out = [] -%}
+          {%- for rule in rich_rules_raw.stdout.split('\n') -%}
+            {%- set line = rule.strip() -%}
+            {%- if line -%}
+              {%- for cidr in migrated_sources -%}
+                {%- if 'source address="' + cidr + '"' in line -%}
+                  {%- set _ = out.append(line) -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Phase 1 - rich rule removal plan
+      debug:
+        msg: |-
+          Phase 1: {{ rules_to_remove | length }} rich rule(s) to remove from
+          {{ source_zone }} (sources now bound to other zones).
+
+    - name: Remove matching rich rules from source zone
+      ansible.posix.firewalld:
+        zone: "{{ source_zone }}"
+        rich_rule: "{{ item }}"
+        permanent: true
+        immediate: true
+        state: disabled
+      loop: "{{ rules_to_remove }}"
+      loop_control:
+        label: "{{ item | regex_replace('^.*source address=\"([^\"]+)\".*port port=\"([^\"]+)\".*$', '\\1 port \\2') | truncate(80) }}"
+
+    # -------- Phase 2: direct ports on public now covered elsewhere --------
+
+    - name: Read current direct ports on source zone
+      command: "firewall-cmd --zone={{ source_zone }} --list-ports"
+      register: public_ports_raw
+      changed_when: false
+      check_mode: false
+
+    - name: Phase 2 - direct-port removal plan
+      debug:
+        msg: |-
+          Phase 2: from {{ source_zone }} direct ports, will remove:
+            tcp: {{ public_direct_ports_to_remove.tcp
+                    | intersect(public_ports_raw.stdout.split()
+                    | select('search', '/tcp$')
+                    | map('regex_replace', '/tcp$', '')
+                    | map('int') | list) }}
+            udp: {{ public_direct_ports_to_remove.udp
+                    | intersect(public_ports_raw.stdout.split()
+                    | select('search', '/udp$')
+                    | map('regex_replace', '/udp$', '')
+                    | map('int') | list) }}
+
+    - name: Remove stale / moved TCP direct ports from source zone
+      ansible.posix.firewalld:
+        zone: "{{ source_zone }}"
+        port: "{{ item }}/tcp"
+        permanent: true
+        immediate: true
+        state: disabled
+      loop: "{{ public_direct_ports_to_remove.tcp }}"
+      loop_control:
+        label: "{{ item }}/tcp"
+
+    - name: Remove stale / moved UDP direct ports from source zone
+      ansible.posix.firewalld:
+        zone: "{{ source_zone }}"
+        port: "{{ item }}/udp"
+        permanent: true
+        immediate: true
+        state: disabled
+      loop: "{{ public_direct_ports_to_remove.udp }}"
+      loop_control:
+        label: "{{ item }}/udp"
+
+    # -------- Phase 3: unbind stale source CIDRs from other zones --------
+
+    - name: Phase 3 - stale source-binding plan
+      debug:
+        msg: |-
+          Phase 3: unbind the following sources:
+          {% for zone, sources in stale_source_bindings.items() %}
+            {{ zone }}: {{ sources | join(', ') }}
+          {% endfor %}
+
+    - name: Flatten stale bindings into (zone, source) pairs
+      set_fact:
+        stale_pairs: >-
+          {%- set out = [] -%}
+          {%- for zone, sources in stale_source_bindings.items() -%}
+            {%- for s in sources -%}
+              {%- set _ = out.append({'zone': zone, 'value': s}) -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Unbind stale sources from their zones
+      ansible.posix.firewalld:
+        zone: "{{ item.zone }}"
+        source: "{{ item.value }}"
+        permanent: true
+        immediate: true
+        state: disabled
+      loop: "{{ stale_pairs }}"
+      loop_control:
+        label: "{{ item.zone }}:{{ item.value }}"

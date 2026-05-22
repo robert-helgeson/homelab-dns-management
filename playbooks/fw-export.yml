@@ -1,0 +1,41 @@
+---
+# One-shot bootstrap: dump current firewalld state as YAML ready to
+# paste under `firewall:` in hosts.yml.
+#
+# Example:
+#   ansible-playbook playbooks/fw-export.yml \
+#     -e fw_target=primary-dns -e zone=public
+#
+# The output is purely a debug print. Copy the block, paste into
+# hosts.yml, then future reconciles have a source of truth to compare
+# against.
+- name: Export current firewalld state for hosts.yml bootstrap
+  hosts: dns_primary
+  gather_facts: false
+  become: true
+
+  vars:
+    fw_target: primary-dns
+    zone: public
+
+  tasks:
+    - name: Read current open ports in zone
+      command: "firewall-cmd --zone={{ zone }} --list-ports"
+      register: listed
+      changed_when: false
+      check_mode: false
+
+    - name: Print hosts.yml-formatted block
+      debug:
+        msg: |-
+          firewall:
+            {{ fw_target }}:
+              zone: {{ zone }}
+              tcp:
+          {% for p in listed.stdout.split() | select('search', '/tcp$') | map('regex_replace', '/tcp$', '') | map('int') | sort %}
+                - {{ p }}
+          {% endfor %}
+              udp:
+          {% for p in listed.stdout.split() | select('search', '/udp$') | map('regex_replace', '/udp$', '') | map('int') | sort %}
+                - {{ p }}
+          {% endfor %}

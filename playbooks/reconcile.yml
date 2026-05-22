@@ -1,0 +1,130 @@
+---
+- name: Reconcile DNS zones on primary
+  hosts: dns_primary
+  gather_facts: true
+
+  vars_files:
+    - ../hosts.yml
+
+  tasks:
+    - name: Pre-flight - verify bind9 container is running
+      command: docker inspect -f '{{ "{{" }}.State.Running{{ "}}" }}' {{ bind9_container_name }}
+      register: bind_running
+      changed_when: false
+      failed_when: bind_running.stdout.strip() != 'true'
+      become: true
+
+    - name: Pre-flight - verify records directory exists
+      stat:
+        path: "{{ bind9_records_dir }}"
+      register: records_dir
+      become: true
+
+    - name: Fail if records dir is missing
+      fail:
+        msg: "Records dir {{ bind9_records_dir }} not found on {{ inventory_hostname }}"
+      when: not records_dir.stat.exists
+
+    - name: Pre-flight - verify rndc is working
+      command: "{{ bind9_status_command }}"
+      register: rndc_precheck
+      changed_when: false
+      become: true
+
+    - name: Reconcile zones
+      block:
+        - name: Back up existing zone files
+          copy:
+            src: "{{ bind9_records_dir }}/{{ item.name }}.db"
+            dest: "{{ bind9_records_dir }}/{{ item.name }}.db.bak"
+            remote_src: true
+            mode: preserve
+          become: true
+          loop: "{{ zones }}"
+          loop_control:
+            label: "{{ item.name }}"
+          when: item.managed | default(false)
+
+        - name: Render zone file
+          template:
+            src: ../templates/zone.db.j2
+            dest: "{{ bind9_records_dir }}/{{ item.name }}.db"
+            owner: root
+            group: root
+            mode: '0644'
+          become: true
+          vars:
+            zone: "{{ item }}"
+            serial: "{{ ansible_date_time.epoch }}"
+          loop: "{{ zones }}"
+          loop_control:
+            label: "{{ item.name }}"
+          when: item.managed | default(false)
+          register: zone_rendered
+
+        - name: Validate rendered zones with named-checkzone
+          # Catches template bugs (bad whitespace, malformed records) before
+          # any reload. On failure, rescue restores every rendered file from
+          # its .bak so we never leave a broken zone on disk.
+          block:
+            - name: Run named-checkzone against each rendered zone
+              command: "{{ bind9_checkzone_command }} {{ item.item.name }} {{ bind9_container_records_dir }}/{{ item.item.name }}.db"
+              become: true
+              loop: "{{ zone_rendered.results }}"
+              loop_control:
+                label: "{{ item.item.name }}"
+              when:
+                - item.item.managed | default(false)
+                - item.changed
+              changed_when: false
+          rescue:
+            - name: Restore zone files from backup after validation failure
+              copy:
+                src: "{{ bind9_records_dir }}/{{ item.item.name }}.db.bak"
+                dest: "{{ bind9_records_dir }}/{{ item.item.name }}.db"
+                remote_src: true
+                mode: preserve
+              become: true
+              loop: "{{ zone_rendered.results }}"
+              loop_control:
+                label: "{{ item.item.name }}"
+              when:
+                - item.item.managed | default(false)
+                - item.changed
+
+            - name: Fail playbook due to invalid rendered zone file
+              fail:
+                msg: "named-checkzone rejected a rendered zone. Backups restored; no reload issued. Inspect the render output and fix the template or hosts.yml."
+
+        - name: Reload changed zones via rndc
+          command: "{{ bind9_reload_command }} {{ item.item.name }}"
+          become: true
+          loop: "{{ zone_rendered.results }}"
+          loop_control:
+            label: "{{ item.item.name }}"
+          when:
+            - item.item.managed | default(false)
+            - item.changed
+          register: reload_result
+
+        - name: Show rndc reload output
+          debug:
+            msg: "{{ item.stdout | default('(no change - not reloaded)') }}"
+          loop: "{{ reload_result.results }}"
+          loop_control:
+            label: "{{ item.item.item.name }}"
+          when: item.changed is defined
+
+        - name: Post-flight - verify BIND is healthy
+          command: "{{ bind9_status_command }}"
+          become: true
+          register: bind_status
+          changed_when: false
+          when: reload_result.changed | default(false)
+
+        - name: Show BIND status
+          debug:
+            msg: "{{ bind_status.stdout_lines }}"
+          when:
+            - bind_status is defined
+            - bind_status.stdout_lines is defined

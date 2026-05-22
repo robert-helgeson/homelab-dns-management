@@ -1,0 +1,187 @@
+---
+# Reconcile NPM proxy hosts against hosts.yml.
+#
+# Safety posture:
+#   - create/update are always on
+#   - delete is opt-in: pass -e destructive=true to actually remove extras
+#   - on a non-destructive run, extras are listed so you can see drift
+#   - destructive runs are guardrailed: aborts if proxies: is empty, or
+#     if more than destructive_max_deletes entries would go. Override
+#     with -e force=true when a bulk cleanup is genuinely intended.
+#
+# Target a single proxy for testing:
+#   ansible-playbook playbooks/reconcile-npm.yml -e proxy_filter=audiobookshelf.homelab.example.com
+#
+# Credentials come from runner env vars NPM_EMAIL / NPM_PASSWORD.
+- name: Reconcile NPM proxy hosts
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../hosts.yml
+
+  vars:
+    destructive: false
+    # Override the destructive guardrails below. Only set when you genuinely
+    # intend a large / total wipe (first import, decommission, etc.).
+    force: false
+    # Max deletes permitted per destructive run without force=true.
+    destructive_max_deletes: 5
+    npm_target: npm_primary
+    proxy_filter: ""
+
+  tasks:
+    - name: Resolve NPM instance config
+      set_fact:
+        npm: "{{ npms[npm_target] }}"
+
+    - name: Fail fast if credentials are missing
+      fail:
+        msg: "NPM credentials not found. Set NPM_EMAIL and NPM_PASSWORD as GitLab CI/CD variables (masked, protected)."
+      when: npm.email | length == 0 or npm.password | length == 0
+
+    # Two-task pattern: the auth call has no_log to keep the password body
+    # out of logs, but we swallow its failure so the next task can surface a
+    # sanitized error (status code + NPM's message, never creds).
+    - name: Pre-flight - verify NPM auth works
+      uri:
+        url: "{{ npm.api_url }}/api/tokens"
+        method: POST
+        body_format: json
+        body:
+          identity: "{{ npm.email }}"
+          secret: "{{ npm.password }}"
+        validate_certs: "{{ npm.validate_certs }}"
+        status_code: 200
+      register: auth_result
+      failed_when: false
+      # Read-only token exchange, safe to run even under --check.
+      # Older ansible uri module (<2.14) otherwise errors out.
+      check_mode: false
+      no_log: true
+
+    - name: Report NPM auth result
+      fail:
+        msg: |
+          NPM auth failed against {{ npm.api_url }}/api/tokens
+            HTTP status : {{ auth_result.status | default('no response') }}
+            NPM message : {{ auth_result.json.error.message | default(auth_result.msg | default('(none)')) }}
+            validate_certs : {{ npm.validate_certs }}
+          Common causes: wrong email/password in CI vars, wrong api_url,
+          runner cannot reach NPM on that host/port, TLS verification mismatch.
+      when: auth_result.status | default(0) != 200
+
+    - name: Select desired proxies for this NPM target
+      set_fact:
+        desired: >-
+          {{ proxies
+             | selectattr('npm_target', 'equalto', npm_target)
+             | selectattr('domain', 'equalto', proxy_filter) | list
+             if proxy_filter | length > 0
+             else proxies | selectattr('npm_target', 'equalto', npm_target) | list }}
+
+    - name: Reconcile desired proxies (create / update)
+      npm_proxy:
+        api_url: "{{ npm.api_url }}"
+        email: "{{ npm.email }}"
+        password: "{{ npm.password }}"
+        validate_certs: "{{ npm.validate_certs }}"
+        domain: "{{ item.domain }}"
+        forward_host: "{{ item.forward_host }}"
+        forward_port: "{{ item.forward_port }}"
+        # Core managed: module defaults kick in when omitted.
+        forward_scheme: "{{ item.forward_scheme | default(omit) }}"
+        certificate_id: "{{ item.certificate_id | default(omit) }}"
+        ssl_forced: "{{ item.ssl_forced | default(omit) }}"
+        allow_websocket_upgrade: "{{ item.allow_websocket_upgrade | default(omit) }}"
+        # Optional managed: unset in hosts.yml = preserve existing NPM value.
+        advanced_config: "{{ item.advanced_config | default(omit) }}"
+        http2_support: "{{ item.http2_support | default(omit) }}"
+        hsts_enabled: "{{ item.hsts_enabled | default(omit) }}"
+        hsts_subdomains: "{{ item.hsts_subdomains | default(omit) }}"
+        block_exploits: "{{ item.block_exploits | default(omit) }}"
+        caching_enabled: "{{ item.caching_enabled | default(omit) }}"
+        access_list_id: "{{ item.access_list_id | default(omit) }}"
+        state: present
+      loop: "{{ desired }}"
+      loop_control:
+        label: "{{ item.domain }}"
+      register: reconcile_results
+
+    - name: Fetch current NPM proxies to compute extras
+      uri:
+        url: "{{ npm.api_url }}/api/nginx/proxy-hosts"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ auth_result.json.token }}"
+        validate_certs: "{{ npm.validate_certs }}"
+      register: current_proxies
+      # Read-only, safe under --check. See note on the auth task above.
+      check_mode: false
+      when: proxy_filter | length == 0
+
+    - name: Compute extras (domains in NPM but not in hosts.yml)
+      set_fact:
+        extras: >-
+          {{ current_proxies.json
+             | map(attribute='domain_names')
+             | map('first')
+             | difference(desired | map(attribute='domain') | list) }}
+      when: proxy_filter | length == 0
+
+    - name: Report extras (destructive=false, nothing deleted)
+      debug:
+        msg: |
+          Extras in NPM not present in hosts.yml:
+          {{ extras | to_nice_yaml }}
+          Run with -e destructive=true to delete these.
+      when:
+        - proxy_filter | length == 0
+        - extras | length > 0
+        - not (destructive | bool)
+
+    # Guardrails for destructive mode. These exist because a previous run
+    # with `destructive=true` against an empty proxies list deleted every
+    # entry in NPM (the desired state was empty, so all 45 hosts were
+    # "extras"). Override with -e force=true only when a bulk delete is
+    # genuinely intended.
+    - name: Safety check - refuse destructive run when desired list is empty
+      fail:
+        msg: |
+          Aborting: destructive=true but proxies: in hosts.yml is empty.
+          This would delete every NPM entry. Populate hosts.yml first, or
+          re-run with -e force=true if a full wipe is actually intended.
+      when:
+        - proxy_filter | length == 0
+        - destructive | bool
+        - desired | length == 0
+        - not (force | bool)
+
+    - name: Safety check - refuse destructive run over the deletion threshold
+      fail:
+        msg: |
+          Aborting: destructive=true would delete {{ extras | length }}
+          entries, above the safety threshold of {{ destructive_max_deletes }}.
+          Re-run with -e force=true if this volume of deletes is intended,
+          or narrow the drift by adding entries back to hosts.yml first.
+      when:
+        - proxy_filter | length == 0
+        - destructive | bool
+        - extras | length > (destructive_max_deletes | int)
+        - not (force | bool)
+
+    - name: Delete extras (destructive=true)
+      npm_proxy:
+        api_url: "{{ npm.api_url }}"
+        email: "{{ npm.email }}"
+        password: "{{ npm.password }}"
+        validate_certs: "{{ npm.validate_certs }}"
+        domain: "{{ item }}"
+        state: absent
+      loop: "{{ extras | default([]) }}"
+      loop_control:
+        label: "{{ item }}"
+      when:
+        - proxy_filter | length == 0
+        - destructive | bool

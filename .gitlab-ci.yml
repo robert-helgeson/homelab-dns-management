@@ -1,0 +1,217 @@
+stages:
+  - check
+  - apply
+  - destructive
+
+variables:
+  ANSIBLE_FORCE_COLOR: "1"
+  ANSIBLE_STDOUT_CALLBACK: "yaml"
+
+.ansible_job: &ansible_job
+  tags: [homelab]
+  before_script:
+    - |
+      echo "=== Runner environment ==="
+      echo "Running as: $(whoami)"
+      echo "Working dir: $(pwd)"
+      echo "Runner host: $(hostname)"
+    - |
+      echo "=== Tooling check ==="
+      for cmd in ansible ansible-playbook ansible-inventory ssh; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+          echo "ERROR: $cmd not found in PATH"
+          echo ""
+          echo "Fix inside the gitlab-runner container:"
+          echo "  docker exec -u root gitlab-runner bash -c 'apt update && apt install -y python3-pip openssh-client'"
+          echo "  docker exec -u root gitlab-runner pip3 install ansible"
+          exit 1
+        fi
+      done
+      ansible --version
+    - |
+      echo "=== Repo structure check ==="
+      for f in ansible.cfg inventory.ini hosts.yml playbooks/reconcile.yml templates/zone.db.j2; do
+        if [ ! -f "$f" ]; then
+          echo "ERROR: expected file missing: $f"
+          exit 1
+        fi
+      done
+      echo "All expected files present."
+    - |
+      echo "=== Inventory parse check ==="
+      ansible-inventory -i inventory.ini --list > /dev/null
+    - |
+      echo "=== Ansible collections check ==="
+      # ansible.posix is required by reconcile-fw.yml (firewalld module).
+      # Install is idempotent; already-present collections are a no-op.
+      ansible-galaxy collection install ansible.posix --upgrade >/dev/null
+    - |
+      echo "=== SSH reachability check ==="
+      ansible dns_primary -m ping
+    - echo "=== All preflight checks passed ==="
+
+check:
+  <<: *ansible_job
+  stage: check
+  script:
+    - ansible-playbook playbooks/reconcile.yml --check --diff
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH'
+
+apply:
+  <<: *ansible_job
+  stage: apply
+  script:
+    - ansible-playbook playbooks/reconcile.yml
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# ---------------------------------------------------------------------------
+# Phase 2: NPM proxy reconciliation
+# ---------------------------------------------------------------------------
+#
+# Credentials come from CI/CD variables (Settings > CI/CD > Variables):
+#   NPM_EMAIL    - masked, protected
+#   NPM_PASSWORD - masked, protected
+#
+# NPM jobs don't SSH anywhere - they hit the NPM API from the runner over
+# HTTPS, so the DNS preflight (inventory + ping) doesn't apply.
+
+.ansible_npm_job: &ansible_npm_job
+  tags: [homelab]
+  before_script:
+    - |
+      echo "=== Runner environment ==="
+      echo "Running as: $(whoami)"
+      echo "Working dir: $(pwd)"
+      echo "Runner host: $(hostname)"
+    - |
+      echo "=== Tooling check ==="
+      for cmd in ansible ansible-playbook; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+          echo "ERROR: $cmd not found in PATH"
+          exit 1
+        fi
+      done
+      ansible --version
+    - |
+      echo "=== Repo structure check ==="
+      for f in ansible.cfg hosts.yml playbooks/reconcile-npm.yml library/npm_proxy.py; do
+        if [ ! -f "$f" ]; then
+          echo "ERROR: expected file missing: $f"
+          exit 1
+        fi
+      done
+    - |
+      echo "=== NPM credentials check ==="
+      if [ -z "${NPM_EMAIL:-}" ] || [ -z "${NPM_PASSWORD:-}" ]; then
+        echo "ERROR: NPM_EMAIL and NPM_PASSWORD must be set as CI/CD variables"
+        echo "       (Settings > CI/CD > Variables; Masked = on, Protect = off so"
+        echo "        they inject on feature branches too; main is the protected"
+        echo "        ref via branch protection, not variable scope)."
+        exit 1
+      fi
+      echo "Creds present: email=$NPM_EMAIL pw_len=${#NPM_PASSWORD}"
+    - echo "=== All NPM preflight checks passed ==="
+
+npm-check:
+  <<: *ansible_npm_job
+  stage: check
+  script:
+    - ansible-playbook playbooks/reconcile-npm.yml --check --diff
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH'
+
+npm-apply:
+  <<: *ansible_npm_job
+  stage: apply
+  script:
+    - ansible-playbook playbooks/reconcile-npm.yml --diff
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# Destructive sweep is manual-only. Deletes NPM entries that are not in
+# hosts.yml. Trigger from GitLab UI: Pipelines > (latest main pipeline) >
+# "npm-destructive" job > Run.
+#
+# Default threshold is 5 deletes per run. To raise it for a single run,
+# set NPM_MAX_DELETES as a pipeline variable in the "Run pipeline" dialog
+# (e.g. NPM_MAX_DELETES=10). It is not persisted anywhere.
+npm-destructive:
+  <<: *ansible_npm_job
+  stage: destructive
+  script:
+    - ansible-playbook playbooks/reconcile-npm.yml --diff
+      -e destructive=true
+      -e "destructive_max_deletes=${NPM_MAX_DELETES:-5}"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: true
+
+# ---------------------------------------------------------------------------
+# Phase 3: firewalld port reconciliation
+# ---------------------------------------------------------------------------
+#
+# Runs against dns_primary (same host as BIND), so the DNS preflight
+# (inventory + SSH ping) applies. Reuses .ansible_job, not the NPM variant.
+
+fw-check:
+  <<: *ansible_job
+  stage: check
+  script:
+    - ansible-playbook playbooks/reconcile-fw.yml --check --diff
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH'
+
+fw-apply:
+  <<: *ansible_job
+  stage: apply
+  script:
+    - ansible-playbook playbooks/reconcile-fw.yml --diff
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# Destructive close is manual-only. Closes ports currently open in the
+# target zone but not listed in hosts.yml. Trigger from GitLab UI.
+# Override threshold for a single run by setting FW_MAX_DELETES on the
+# Run pipeline dialog (e.g. FW_MAX_DELETES=10).
+fw-destructive:
+  <<: *ansible_job
+  stage: destructive
+  script:
+    - ansible-playbook playbooks/reconcile-fw.yml --diff
+      -e destructive=true
+      -e "destructive_max_deletes=${FW_MAX_DELETES:-5}"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: true
+
+# Manual audit job. Dumps the full firewalld state for every active
+# zone on primary-dns - services, ports, forward ports, rich rules,
+# masquerade. Read-only; trigger whenever you want a snapshot.
+fw-audit:
+  <<: *ansible_job
+  stage: check
+  script:
+    - ansible-playbook playbooks/fw-audit.yml
+  rules:
+    - when: manual
+      allow_failure: true
+
+# Manual identify job. Correlates the firewall port list in hosts.yml
+# with what processes are actually listening on the host. Surfaces
+# "ghost" ports - in hosts.yml but nothing bound - so you can close
+# rules for services that aren't running anymore.
+fw-identify:
+  <<: *ansible_job
+  stage: check
+  script:
+    - ansible-playbook playbooks/fw-identify.yml
+  rules:
+    - when: manual
+      allow_failure: true

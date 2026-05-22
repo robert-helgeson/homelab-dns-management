@@ -1,0 +1,30 @@
+$TTL {{ zone.ttl }}
+$ORIGIN {{ zone.name }}.
+@               IN    SOA    {{ zone.nameservers[0].name }}.{{ zone.name }}. {{ zone.admin_email }}.{{ zone.name }}. (
+                                 {{ serial }}     ; serial
+                                 {{ zone.soa.refresh }}            ; refresh
+                                 {{ zone.soa.retry }}            ; retry
+                                 {{ zone.soa.expire }}             ; expire
+                                 {{ zone.soa.minimum }}             ; minimum ttl
+                              )
+{% for ns in zone.nameservers %}
+                IN    NS     {{ ns.name }}.{{ zone.name }}.
+{% endfor %}
+; A records for name servers
+{% for ns in zone.nameservers %}
+{{ "%-15s" | format(ns.name) }} IN    A      {{ ns.ip }}
+{% endfor %}
+{% if zone.a_records | length > 0 %}
+; A records for servers
+{% for r in zone.a_records %}
+{{ "%-15s" | format(r.name) }} {% if r.ttl is defined %}{{ r.ttl }} {% endif %}IN    A      {{ r.ip }}
+{% endfor %}
+{% endif %}
+; Primary A record
+@               IN    A      {{ zone.apex_ip }}
+{% if zone.cnames | length > 0 %}
+; CNAME records
+{% for c in zone.cnames %}
+{{ "%-15s" | format(c.name) }} {% if c.ttl is defined %}{{ c.ttl }} {% endif %}IN    CNAME  {{ c.target }}
+{% endfor %}
+{% endif %}

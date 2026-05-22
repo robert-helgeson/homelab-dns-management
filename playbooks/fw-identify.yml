@@ -1,0 +1,114 @@
+---
+# Identify what process owns each listening port on the target host.
+# Output is grouped by zone-like classification:
+#   - "listening" - port in hosts.yml AND a process is bound
+#   - "ghost" - port in hosts.yml but NOTHING is listening (close it)
+#   - "unmanaged" - process is listening but port not in hosts.yml
+#
+# Read-only; no changes made.
+- name: Identify listening ports on host
+  hosts: dns_primary
+  gather_facts: false
+  become: true
+
+  vars_files:
+    - ../hosts.yml
+
+  vars:
+    fw_target: primary-dns
+
+  tasks:
+    - name: Gather listening TCP + UDP with process names
+      # ss flags: -H no header, -t tcp, -u udp, -l listen, -n numeric, -p processes.
+      # awk pulls the port (last colon-separated token of local-addr) and
+      # the process name from the users:(("proc",...)) trailer.
+      shell: |
+        {
+          ss -Htlnp | awk '{
+            n = split($4, a, ":"); port = a[n]
+            proc = "?"
+            if (match($0, /"[^"]+"/)) {
+              proc = substr($0, RSTART+1, RLENGTH-2)
+            }
+            print "tcp " port " " proc
+          }'
+          ss -Hulnp | awk '{
+            n = split($4, a, ":"); port = a[n]
+            proc = "?"
+            if (match($0, /"[^"]+"/)) {
+              proc = substr($0, RSTART+1, RLENGTH-2)
+            }
+            print "udp " port " " proc
+          }'
+        } | sort -u
+      register: port_map_raw
+      changed_when: false
+
+    - name: Gather docker container published ports (names, not just ports)
+      shell: |
+        docker ps --format '{% raw %}{{.Names}}:{{.Ports}}{% endraw %}' 2>/dev/null || true
+      register: docker_raw
+      changed_when: false
+
+    - name: Parse port map into lookup dict
+      set_fact:
+        listening: >-
+          {%- set out = {} -%}
+          {%- for line in port_map_raw.stdout_lines -%}
+            {%- set parts = line.split(' ', 2) -%}
+            {%- if parts | length == 3 -%}
+              {%- set key = parts[1] ~ '/' ~ parts[0] -%}
+              {%- set _ = out.update({key: parts[2]}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Flatten managed ports from hosts.yml into "N/proto" form
+      set_fact:
+        managed_tcp: >-
+          {%- set out = [] -%}
+          {%- for zcfg in firewall[fw_target].zones.values() -%}
+            {%- for p in zcfg.tcp | default([]) -%}
+              {%- set _ = out.append(p | string ~ '/tcp') -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ out | unique | list }}
+        managed_udp: >-
+          {%- set out = [] -%}
+          {%- for zcfg in firewall[fw_target].zones.values() -%}
+            {%- for p in zcfg.udp | default([]) -%}
+              {%- set _ = out.append(p | string ~ '/udp') -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ out | unique | list }}
+
+    - name: Report listening managed ports (port -> process)
+      debug:
+        msg: |-
+          === Managed ports with a listener (process name) ===
+          {% for p in (managed_tcp + managed_udp) | sort %}
+          {% if p in listening %}  {{ '%-10s' | format(p) }} {{ listening[p] }}{% endif %}
+          {% endfor %}
+
+    - name: Report GHOST ports (managed but nothing listening - close these)
+      debug:
+        msg: |-
+          === GHOST ports (in hosts.yml but no process is listening) ===
+          These are candidates for removal - nothing is using them.
+          {% for p in (managed_tcp + managed_udp) | sort %}
+          {% if p not in listening %}  {{ p }}{% endif %}
+          {% endfor %}
+
+    - name: Report unmanaged listening ports (listening but not in hosts.yml)
+      debug:
+        msg: |-
+          === Unmanaged listening ports (listening, not in hosts.yml) ===
+          Bound to a process but firewalld isn't managing them - expected
+          for localhost-only binds or docker-handled services.
+          {% for port in listening.keys() | sort %}
+          {% if port not in (managed_tcp + managed_udp) %}  {{ '%-10s' | format(port) }} {{ listening[port] }}{% endif %}
+          {% endfor %}
+
+    - name: Docker container raw port mappings (for reference)
+      debug:
+        msg: "{{ docker_raw.stdout_lines }}"

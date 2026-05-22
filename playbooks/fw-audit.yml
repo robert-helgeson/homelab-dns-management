@@ -1,0 +1,69 @@
+---
+# Read-only audit of firewalld state on the target host. Dumps every
+# active zone's full contents so complex setups (lots of rich rules,
+# forward-ports, etc.) can be read and understood before deciding what
+# to bring under reconciliation.
+#
+# Nothing is changed; nothing is reconciled. Run from CI via the
+# fw-audit manual job or locally:
+#   ansible-playbook playbooks/fw-audit.yml
+- name: Audit firewalld state
+  hosts: dns_primary
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Collect full --list-all-zones dump
+      command: firewall-cmd --list-all-zones
+      register: all_zones
+      changed_when: false
+      check_mode: false
+
+    - name: Print full zone dump (services, ports, rich rules, etc. per zone)
+      debug:
+        msg: "{{ all_zones.stdout_lines }}"
+
+    - name: Collect active zone summary
+      command: firewall-cmd --get-active-zones
+      register: active_zones
+      changed_when: false
+      check_mode: false
+
+    - name: Extract active zone names
+      # --get-active-zones output: zone name at column 0, details indented.
+      # Keep only the zone-name lines.
+      set_fact:
+        active_zone_names: >-
+          {{ active_zones.stdout_lines
+             | reject('match', '^\s')
+             | reject('match', '^$')
+             | list }}
+
+    - name: Print active zones summary
+      debug:
+        msg: |
+          Active zones: {{ active_zone_names | join(', ') }}
+
+    - name: Collect rich rules per active zone
+      command: "firewall-cmd --zone={{ item }} --list-rich-rules"
+      loop: "{{ active_zone_names }}"
+      register: rich_rules
+      changed_when: false
+      check_mode: false
+
+    - name: Print numbered rich rules per zone
+      # Numbering makes it easy to reference specific rules when
+      # deciding which to keep, refactor, or move into hosts.yml.
+      debug:
+        msg: |-
+          === Rich rules in zone: {{ item.item }} ({{ item.stdout_lines | length }} total) ===
+          {% if item.stdout_lines | length == 0 %}
+          (none)
+          {% else %}
+          {% for rule in item.stdout_lines %}
+          [{{ '%2d' | format(loop.index) }}] {{ rule }}
+          {% endfor %}
+          {% endif %}
+      loop: "{{ rich_rules.results }}"
+      loop_control:
+        label: "{{ item.item }}"

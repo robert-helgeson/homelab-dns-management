@@ -1,0 +1,14 @@
+---
+# BIND9 container paths (on the host filesystem)
+bind9_container_name: bind9
+bind9_records_dir: /opt/storage/docker/bind9/volumes/records
+
+# Same records dir as seen from inside the bind9 container - needed for
+# named-checkzone, which runs in-container and sees the mounted path.
+bind9_container_records_dir: /var/lib/bind
+
+# How to reload zones - uses docker exec against the bind9 container
+# Kept as a variable so future changes (rndc via a different method, etc.) are one-line
+bind9_reload_command: "docker exec {{ bind9_container_name }} rndc reload"
+bind9_status_command: "docker exec {{ bind9_container_name }} rndc status"
+bind9_checkzone_command: "docker exec {{ bind9_container_name }} named-checkzone"

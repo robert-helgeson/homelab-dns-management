@@ -1,0 +1,292 @@
+---
+# Reconcile firewalld zones on a host against hosts.yml.
+#
+# Schema: firewall.<host>.zones is a dict of zone_name -> {sources,
+# services, tcp, udp}. Zones not in hosts.yml are ignored entirely -
+# the default public/trusted/docker zones stay under firewalld's own
+# control unless you explicitly add them here.
+#
+# Safety posture:
+#   - adds (ports, services, sources) always applied
+#   - removes opt-in via -e destructive=true, guardrailed:
+#     aborts if total removes across all zones exceed
+#     destructive_max_deletes. Override with -e force=true.
+#
+# Staged rollout for the initial migration:
+#   1. Define zones with port/service lists but empty sources. Apply.
+#      Verify the zones exist (via fw-audit) before attaching sources.
+#   2. Add sources to zones. Apply. Traffic re-routes; test each
+#      source subnet immediately - revert by emptying sources and
+#      re-applying, or by removing the source via firewall-cmd.
+#   3. Once stable, run fw-migrate.yml to strip the old rich rules
+#      from the public zone that matched those sources.
+- name: Reconcile firewalld zones
+  hosts: dns_primary
+  gather_facts: false
+  become: true
+
+  vars_files:
+    - ../hosts.yml
+
+  vars:
+    destructive: false
+    force: false
+    destructive_max_deletes: 5
+    fw_target: primary-dns
+
+  tasks:
+    - name: Resolve firewalld config for target
+      set_fact:
+        fw: "{{ firewall[fw_target] }}"
+
+    - name: Fail fast if zones dict is missing or malformed
+      fail:
+        msg: "firewall.{{ fw_target }}.zones must be a dict of zone definitions"
+      when: fw.zones is not defined or fw.zones is not mapping
+
+    - name: Ensure firewalld service is active
+      service:
+        name: firewalld
+        state: started
+
+    # -------- Zone creation --------
+    #
+    # `firewall-cmd --permanent --new-zone` writes the permanent config
+    # only; the runtime isn't aware of the zone until `firewall-cmd
+    # --reload`. We always reload after the create phase so a prior
+    # half-finished run (zone in permanent, not in runtime) gets fixed
+    # automatically. Reload is cheap and idempotent.
+
+    - name: Read zones in permanent config
+      command: firewall-cmd --permanent --get-zones
+      register: permanent_zones_raw
+      changed_when: false
+      check_mode: false
+
+    - name: Create zones missing from permanent config
+      command: "firewall-cmd --permanent --new-zone={{ item }}"
+      loop: "{{ fw.zones.keys() | list }}"
+      when: item not in permanent_zones_raw.stdout.split()
+      # Zone creation is a prerequisite for the real apply/diff work. An
+      # empty zone accepts no traffic, so we allow this to run under
+      # --check; the alternative is check runs never seeing the zones
+      # that hosts.yml says should exist.
+      check_mode: false
+
+    - name: Reload firewalld so new zones become visible in runtime
+      command: firewall-cmd --reload
+      changed_when: false
+      # Same rationale as the create task above - without a reload here,
+      # --check runs can't query the zones hosts.yml declares.
+      check_mode: false
+
+    - name: Confirm expected zones are in runtime after reload
+      command: firewall-cmd --get-zones
+      register: runtime_zones_after
+      changed_when: false
+      check_mode: false
+
+    - name: Fail fast if any expected zone is still missing from runtime
+      fail:
+        msg: |
+          Reload completed but these zones are still missing from firewalld runtime:
+          {{ fw.zones.keys() | list | difference(runtime_zones_after.stdout.split()) }}
+          Check /etc/firewalld/zones/ on the host and `journalctl -u firewalld`.
+      when: (fw.zones.keys() | list | difference(runtime_zones_after.stdout.split())) | length > 0
+
+    # -------- Flatten desired state into per-entry actions --------
+    #
+    # Build three flat lists from fw.zones so the apply/remove tasks
+    # below become simple loops instead of nested ones. Each entry
+    # carries its zone so loop_control labels stay informative.
+
+    - name: Flatten desired services per zone
+      set_fact:
+        desired_services: >-
+          {%- set out = [] -%}
+          {%- for zname, zcfg in fw.zones.items() -%}
+            {%- for s in zcfg.services | default([]) -%}
+              {%- set _ = out.append({'zone': zname, 'value': s}) -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Flatten desired ports per zone (tcp + udp, "N/proto" form)
+      set_fact:
+        desired_ports: >-
+          {%- set out = [] -%}
+          {%- for zname, zcfg in fw.zones.items() -%}
+            {%- for p in zcfg.tcp | default([]) -%}
+              {%- set _ = out.append({'zone': zname, 'value': (p | string) + '/tcp'}) -%}
+            {%- endfor -%}
+            {%- for p in zcfg.udp | default([]) -%}
+              {%- set _ = out.append({'zone': zname, 'value': (p | string) + '/udp'}) -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Flatten desired sources per zone
+      set_fact:
+        desired_sources: >-
+          {%- set out = [] -%}
+          {%- for zname, zcfg in fw.zones.items() -%}
+            {%- for src in zcfg.sources | default([]) -%}
+              {%- set _ = out.append({'zone': zname, 'value': src}) -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+
+    # -------- Apply desired state --------
+
+    - name: Ensure desired services are enabled
+      ansible.posix.firewalld:
+        service: "{{ item.value }}"
+        zone: "{{ item.zone }}"
+        permanent: true
+        immediate: true
+        state: enabled
+      loop: "{{ desired_services }}"
+      loop_control:
+        label: "{{ item.zone }}:{{ item.value }}"
+
+    - name: Ensure desired ports are open
+      ansible.posix.firewalld:
+        port: "{{ item.value }}"
+        zone: "{{ item.zone }}"
+        permanent: true
+        immediate: true
+        state: enabled
+      loop: "{{ desired_ports }}"
+      loop_control:
+        label: "{{ item.zone }}:{{ item.value }}"
+
+    - name: Ensure desired sources are bound
+      # A source can be bound to exactly one zone at a time. Adding it
+      # here automatically unbinds it from its previous zone - expected
+      # behavior for the initial migration.
+      ansible.posix.firewalld:
+        source: "{{ item.value }}"
+        zone: "{{ item.zone }}"
+        permanent: true
+        immediate: true
+        state: enabled
+      loop: "{{ desired_sources }}"
+      loop_control:
+        label: "{{ item.zone }}:{{ item.value }}"
+
+    # -------- Drift detection: what's present but not desired --------
+
+    - name: Read current state per managed zone
+      command: "firewall-cmd --zone={{ item }} --list-all"
+      loop: "{{ fw.zones.keys() | list }}"
+      register: zone_state_raw
+      changed_when: false
+      check_mode: false
+
+    - name: Parse current state per zone into a dict
+      set_fact:
+        current_state: >-
+          {%- set result = {} -%}
+          {%- for r in zone_state_raw.results -%}
+            {%- set zname = r.item -%}
+            {%- set services = [] -%}
+            {%- set ports = [] -%}
+            {%- set sources = [] -%}
+            {%- for line in r.stdout.split('\n') -%}
+              {%- set s = line.strip() -%}
+              {%- if s.startswith('services:') -%}
+                {%- set _ = services.extend(s.split(':', 1)[1].split()) -%}
+              {%- elif s.startswith('ports:') -%}
+                {%- set _ = ports.extend(s.split(':', 1)[1].split()) -%}
+              {%- elif s.startswith('sources:') -%}
+                {%- set _ = sources.extend(s.split(':', 1)[1].split()) -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- set _ = result.update({zname: {'services': services, 'ports': ports, 'sources': sources}}) -%}
+          {%- endfor -%}
+          {{ result }}
+
+    - name: Compute extras per zone (present in firewalld, not in hosts.yml)
+      set_fact:
+        extras: >-
+          {%- set out = [] -%}
+          {%- for zname, zcfg in fw.zones.items() -%}
+            {%- set cur = current_state[zname] -%}
+            {%- set want_services = zcfg.services | default([]) -%}
+            {%- set want_ports = (zcfg.tcp | default([]) | map('string') | map('regex_replace', '$', '/tcp') | list)
+                               + (zcfg.udp | default([]) | map('string') | map('regex_replace', '$', '/udp') | list) -%}
+            {%- set want_sources = zcfg.sources | default([]) -%}
+            {%- for s in cur.services | difference(want_services) -%}
+              {%- set _ = out.append({'zone': zname, 'kind': 'service', 'value': s}) -%}
+            {%- endfor -%}
+            {%- for p in cur.ports | difference(want_ports) -%}
+              {%- set _ = out.append({'zone': zname, 'kind': 'port', 'value': p}) -%}
+            {%- endfor -%}
+            {%- for src in cur.sources | difference(want_sources) -%}
+              {%- set _ = out.append({'zone': zname, 'kind': 'source', 'value': src}) -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Report extras (destructive=false, nothing removed)
+      debug:
+        msg: |
+          Drift in managed zones (not in hosts.yml):
+          {% for e in extras %}
+            {{ e.zone }}: {{ e.kind }} {{ e.value }}
+          {% endfor %}
+          Run with -e destructive=true to remove these.
+      when:
+        - extras | length > 0
+        - not (destructive | bool)
+
+    # -------- Destructive guardrails --------
+
+    - name: Safety check - refuse destructive run over the removal threshold
+      fail:
+        msg: |
+          Aborting: destructive=true would remove {{ extras | length }}
+          entries across managed zones, above the safety threshold of
+          {{ destructive_max_deletes }}.
+          Re-run with -e force=true if intentional, or narrow the drift
+          first by adding entries back to hosts.yml.
+      when:
+        - destructive | bool
+        - (extras | length) > (destructive_max_deletes | int)
+        - not (force | bool)
+
+    - name: Remove extra services (destructive=true)
+      ansible.posix.firewalld:
+        service: "{{ item.value }}"
+        zone: "{{ item.zone }}"
+        permanent: true
+        immediate: true
+        state: disabled
+      loop: "{{ extras | selectattr('kind', 'equalto', 'service') | list }}"
+      loop_control:
+        label: "{{ item.zone }}:{{ item.value }}"
+      when: destructive | bool
+
+    - name: Remove extra ports (destructive=true)
+      ansible.posix.firewalld:
+        port: "{{ item.value }}"
+        zone: "{{ item.zone }}"
+        permanent: true
+        immediate: true
+        state: disabled
+      loop: "{{ extras | selectattr('kind', 'equalto', 'port') | list }}"
+      loop_control:
+        label: "{{ item.zone }}:{{ item.value }}"
+      when: destructive | bool
+
+    - name: Remove extra sources (destructive=true)
+      ansible.posix.firewalld:
+        source: "{{ item.value }}"
+        zone: "{{ item.zone }}"
+        permanent: true
+        immediate: true
+        state: disabled
+      loop: "{{ extras | selectattr('kind', 'equalto', 'source') | list }}"
+      loop_control:
+        label: "{{ item.zone }}:{{ item.value }}"
+      when: destructive | bool
