@@ -1,11 +1,37 @@
-# homelab-hosts
+# homelab-dns-management
 
 Git-driven DNS, reverse proxy, and firewall management for a homelab.
-Edits to a single YAML file drive zone file generation (BIND9 with
-DNSSEC), Nginx Proxy Manager entries, and firewalld port rules across
-multiple hosts. A CI/CD pipeline runs check on every branch, applies on
-merge to main, and gates destructive operations behind manual approval
-and safety thresholds.
+Edit one YAML file, push to Git, and a CI/CD pipeline reconciles BIND9
+(with DNSSEC), Nginx Proxy Manager, and firewalld across multiple hosts
+to match. Destructive operations are gated behind manual approval and
+safety thresholds.
+
+> **Note:** this is a sanitized mirror of a real system that has been
+> running my homelab in production. Hostnames, IPs, and domain names
+> have been generalized for public release; the workflow, playbooks,
+> custom module, and recovery procedures are unchanged from what's
+> running live.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    A[hosts.yml<br/><i>Single source of truth</i>] --> B[GitLab CI<br/><i>Check, apply, destructive</i>]
+    B --> C[Ansible<br/><i>Idempotent reconcile</i>]
+    C --> D[BIND9<br/><i>DNS zones, DNSSEC</i>]
+    C --> E[Nginx Proxy Manager<br/><i>Reverse proxy via API</i>]
+    C --> F[firewalld<br/><i>Zones, ports, sources</i>]
+    G[Destructive ops gated<br/><i>Manual job + threshold guard</i>] -.guards.-> B
+```
+
+`hosts.yml` is the single source of truth. A commit triggers GitLab CI,
+which runs Ansible in `--check --diff` on branches and applies on merge
+to `main`. Ansible reconciles three independent subsystems — BIND9,
+Nginx Proxy Manager, and firewalld — using idempotent playbooks and a
+custom module for the NPM REST API. Destructive operations (deleting
+records, removing proxy entries, closing ports) are isolated into
+separate manually-triggered jobs and guarded by deletion-count
+thresholds.
 
 ## What this demonstrates
 
@@ -170,8 +196,8 @@ proxies:
     forward_port: 8000
 ```
 
-Core optional fields (with defaults): `forward_scheme: http`, `certificate_id: 1`,
-`ssl_forced: true`, `allow_websocket_upgrade: true`.
+Core optional fields (with defaults): `forward_scheme: http`,
+`certificate_id: 1`, `ssl_forced: true`, `allow_websocket_upgrade: true`.
 
 For per-host tweaks (Proxmox nodes, anything with a self-signed backend, etc.),
 add any of the following and they become source-of-truth for that entry —
@@ -200,10 +226,10 @@ Example for a Proxmox node:
 
 NPM reconciliation runs through the pipeline, same Git flow as DNS:
 
-| Action | How |
-|---|---|
-| Dry run (diff of what would change) | Push to any non-main branch or open an MR → `npm-check` runs automatically |
-| Apply (create / update only) | Merge to `main` → `npm-apply` runs automatically |
+| Action                                                    | How                                                                                 |
+| --------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| Dry run (diff of what would change)                       | Push to any non-main branch or open an MR → `npm-check` runs automatically          |
+| Apply (create / update only)                              | Merge to `main` → `npm-apply` runs automatically                                    |
 | Destructive sweep (delete NPM entries not in `hosts.yml`) | Merge to `main`, then manually trigger the `npm-destructive` job from the GitLab UI |
 
 A non-destructive `npm-apply` still reports extras — entries that exist in
@@ -257,10 +283,9 @@ was still empty.
 
 ## Recovery: "every site shows ERR_SSL_UNRECOGNIZED_NAME_ALERT"
 
-Symptom: every proxied domain returns
-`ERR_SSL_UNRECOGNIZED_NAME_ALERT` at the TLS handshake. NPM admin UI at
-`http://10.0.0.19:81` still works and lists the proxy hosts, *or* lists
-none at all.
+Symptom: every proxied domain returns `ERR_SSL_UNRECOGNIZED_NAME_ALERT` at
+the TLS handshake. NPM admin UI at `http://10.0.0.19:81` still works and
+lists the proxy hosts, *or* lists none at all.
 
 Root cause: NPM's proxy hosts have been deleted via the API (either by
 this playbook with `destructive=true`, or manually through the UI).
@@ -289,7 +314,7 @@ sudo sqlite3 volumes/nginx_proxy_manager/data/database.sqlite \
 sudo docker compose up -d
 ```
 
-**Step 2 — regenerate nginx config files**. The DB restore brings rows
+**Step 2 — regenerate nginx config files.** The DB restore brings rows
 back but does not recreate the `/data/nginx/proxy_host/*.conf` files.
 NPM only writes those on create/update API calls. Run the regen script
 from this repo:
@@ -370,13 +395,13 @@ stays in firewalld's own config and is visible via `fw-audit`.
 
 ### Running
 
-| Action | How |
-|---|---|
-| Dry run (diff of what would change) | Push to any non-main branch or open an MR → `fw-check` runs automatically |
-| Apply (open missing ports, bind sources) | Merge to `main` → `fw-apply` runs automatically |
-| Destructive close (remove services/ports/sources not in `hosts.yml`) | Manually trigger `fw-destructive` from the GitLab UI on a main pipeline |
-| Read-only state dump (audit all zones, numbered rich rules) | Manually trigger `fw-audit` from the GitLab UI |
-| One-shot cleanup of old rich rules from `public` after a zone migration | Manually run `playbooks/fw-migrate.yml` |
+| Action                                                                  | How                                                                       |
+| ----------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| Dry run (diff of what would change)                                     | Push to any non-main branch or open an MR → `fw-check` runs automatically |
+| Apply (open missing ports, bind sources)                                | Merge to `main` → `fw-apply` runs automatically                           |
+| Destructive close (remove services/ports/sources not in `hosts.yml`)    | Manually trigger `fw-destructive` from the GitLab UI on a main pipeline   |
+| Read-only state dump (audit all zones, numbered rich rules)             | Manually trigger `fw-audit` from the GitLab UI                            |
+| One-shot cleanup of old rich rules from `public` after a zone migration | Manually run `playbooks/fw-migrate.yml`                                   |
 
 `fw-apply` opens listed ports but does not close anything. A
 non-destructive run still reports extras in the job log, so you can see
@@ -401,6 +426,11 @@ via the same variable-passing mechanism.
 
 - Serial number is Unix epoch — monotonic, no state management needed
 - BIND's `inline-signing` re-signs the zone automatically on reload
-- DNSSEC keys live at `/opt/storage/docker/bind9/volumes/cache/` on primary-dns — backed up separately to `/opt/backup/`
-- NPM admin UI uses a self-signed cert; the playbook sets `validate_certs: false` for that reason
-- `ansible.posix` collection is required for `reconcile-fw.yml` (firewalld module). CI installs it automatically in the preflight; for local runs install once with `ansible-galaxy collection install ansible.posix`
+- DNSSEC keys live at `/opt/storage/docker/bind9/volumes/cache/` on
+  primary-dns — backed up separately to `/opt/backup/`
+- NPM admin UI uses a self-signed cert; the playbook sets
+  `validate_certs: false` for that reason
+- `ansible.posix` collection is required for `reconcile-fw.yml`
+  (firewalld module). CI installs it automatically in the preflight;
+  for local runs install once with
+  `ansible-galaxy collection install ansible.posix`
