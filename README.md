@@ -55,14 +55,14 @@ thresholds.
 ## DNS reconciliation
 
 Both `homelab.example.com` (managed) and `secondary.example.com` (unmanaged,
-dormant). Runs against `primary-dns` (10.0.0.19) which is the primary
+dormant). Runs against `primary-dns` (10.0.0.1) which is the primary
 BIND. `watchdog-pi` (10.0.0.2) picks up changes via standard BIND AXFR
 zone transfer, configured at the BIND server level.
 
 ## Reverse proxy reconciliation
 
 NPM (Nginx Proxy Manager) reconciliation against the instance at
-`10.0.0.19:81`. Entries in `hosts.yml` under `proxies:` are created or
+`10.0.0.1:81`. Entries in `hosts.yml` under `proxies:` are created or
 updated to match; deletes are opt-in via a flag. The second NPM
 (`10.0.0.2`) is intentionally out of scope.
 
@@ -192,7 +192,7 @@ Append to `proxies:` in `hosts.yml`. Simple case:
 proxies:
   - domain: audiobookshelf.homelab.example.com
     npm_target: npm_primary
-    forward_host: 10.0.0.19
+    forward_host: 10.0.0.1
     forward_port: 8000
 ```
 
@@ -284,7 +284,7 @@ was still empty.
 ## Recovery: "every site shows ERR_SSL_UNRECOGNIZED_NAME_ALERT"
 
 Symptom: every proxied domain returns `ERR_SSL_UNRECOGNIZED_NAME_ALERT` at
-the TLS handshake. NPM admin UI at `http://10.0.0.19:81` still works and
+the TLS handshake. NPM admin UI at `http://10.0.0.1:81` still works and
 lists the proxy hosts, *or* lists none at all.
 
 Root cause: NPM's proxy hosts have been deleted via the API (either by
